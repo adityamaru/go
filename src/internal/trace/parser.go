@@ -151,7 +151,7 @@ func readTrace(r io.Reader) (ver int, events []rawEvent, strings map[uint64]stri
 		return
 	}
 	switch ver {
-	case 1005, 1007, 1008, 1009, 1010, 1011, 1019:
+	case 1005, 1007, 1008, 1009, 1010, 1011, 1019, 1021:
 		// Note: When adding a new version, confirm that canned traces from the
 		// old version are part of the test suite. Add them using mkcanned.bash.
 		break
@@ -393,6 +393,17 @@ func parseEvents(ver int, rawEvents []rawEvent, strings map[uint64]string) (even
 				}
 				stacks[id] = stk
 			}
+		case EvGoroutineLabels:
+			e := &Event{Off: raw.off, Type: raw.typ, P: lastP}
+			e.Ts = lastTs + int64(raw.args[0])
+			lastTs = e.Ts
+			e.G = raw.args[1]
+			copy(e.Args[:], raw.args[1:])
+			for _, a := range raw.args[2 : len(raw.args)-1] {
+				e.SArgs = append(e.SArgs, strings[a])
+			}
+			e.StkID = raw.args[len(raw.args)-1]
+			batches[lastP] = append(batches[lastP], e)
 		default:
 			e := &Event{Off: raw.off, Type: raw.typ, P: lastP, G: lastG}
 			var argOffset int
@@ -988,7 +999,8 @@ func (ev *Event) String() string {
 // sequence numbers and differences between trace format versions.
 func argNum(raw rawEvent, ver int) int {
 	desc := EventDescriptions[raw.typ]
-	if raw.typ == EvStack {
+	switch raw.typ {
+	case EvStack, EvGoroutineLabels:
 		return len(raw.args)
 	}
 	narg := len(desc.Args)
@@ -1079,7 +1091,8 @@ const (
 	EvUserRegion        = 47 // trace.WithRegion [timestamp, internal task id, mode(0:start, 1:end), stack, name string]
 	EvUserLog           = 48 // trace.Log [timestamp, internal id, key string id, stack, value string]
 	EvCPUSample         = 49 // CPU profiling sample [timestamp, stack, real timestamp, real P id (-1 when absent), goroutine id]
-	EvCount             = 50
+	EvGoroutineLabels   = 50 // goroutine has labels applied [timestamp, goroutine id, label key and value string ids]
+	EvCount             = 51
 )
 
 var EventDescriptions = [EvCount]struct {
@@ -1139,4 +1152,10 @@ var EventDescriptions = [EvCount]struct {
 	EvUserRegion:        {"UserRegion", 1011, true, []string{"taskid", "mode", "typeid"}, []string{"name"}},
 	EvUserLog:           {"UserLog", 1011, true, []string{"id", "keyid"}, []string{"category", "message"}},
 	EvCPUSample:         {"CPUSample", 1019, true, []string{"ts", "p", "g"}, nil},
+	// EvGoroutineLabels has a variable number of string arguments following
+	// its first argument, represeting the key-value string pairs from a set
+	// of labels. There can be zero labels in an event, such as when
+	// pprof.Do restores the previous (possibly empty) set of labels to a
+	// goroutine.
+	EvGoroutineLabels: {"GoroutineLabels", 1021, true, []string{"g"}, nil},
 }

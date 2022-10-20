@@ -71,7 +71,8 @@ const (
 	traceEvUserRegion        = 47 // trace.WithRegion [timestamp, internal task id, mode(0:start, 1:end), stack, name string]
 	traceEvUserLog           = 48 // trace.Log [timestamp, internal task id, key string id, stack, value string]
 	traceEvCPUSample         = 49 // CPU profiling sample [timestamp, stack, real timestamp, real P id (-1 when absent), goroutine id]
-	traceEvCount             = 50
+	traceEvGoroutineLabels   = 50 // goroutine has labels applied [timestamp, goroutine id, label key and value string ids]
+	traceEvCount             = 51
 	// Byte is used but only 6 bits are available for event type.
 	// The remaining 2 bits are used to specify the number of arguments.
 	// That means, the max event type value is 63.
@@ -253,6 +254,14 @@ func StartTrace() error {
 	// here.)
 	atomicstorep(unsafe.Pointer(&trace.cpuLogWrite), unsafe.Pointer(profBuf))
 
+	// string to id mapping
+	//  0 : reserved for an empty string
+	//  remaining: other strings registered by traceString
+	trace.stringSeq = 0
+	// needs to be initialized now so it can be updated by
+	// traceGoroutineLabels
+	trace.strings = make(map[string]uint64)
+
 	// World is stopped, no need to lock.
 	forEachGRace(func(gp *g) {
 		status := readgstatus(gp)
@@ -262,6 +271,11 @@ func StartTrace() error {
 			// +PCQuantum because traceFrameForPC expects return PCs and subtracts PCQuantum.
 			id := trace.stackTab.put([]uintptr{startPCforTrace(gp.startpc) + sys.PCQuantum})
 			traceEvent(traceEvGoCreate, -1, uint64(gp.goid), uint64(id), stackID)
+			traceEvent(traceEvGoCreate, -1, uint64(gp.goid), uint64(id), stackID)
+
+			// Goroutines which existed before tracing started can have labels, so
+			// make sure that those labels are captured in the event stream
+			traceGoroutineLabels(gp)
 		}
 		if status == _Gwaiting {
 			// traceEvGoWaiting is implied to have seq=1.
@@ -285,12 +299,6 @@ func StartTrace() error {
 	trace.timeStart = nanotime()
 	trace.headerWritten = false
 	trace.footerWritten = false
-
-	// string to id mapping
-	//  0 : reserved for an empty string
-	//  remaining: other strings registered by traceString
-	trace.stringSeq = 0
-	trace.strings = make(map[string]uint64)
 
 	trace.seqGC = 0
 	_g_.m.startingtrace = false
@@ -622,7 +630,10 @@ func traceEvent(ev byte, skip int, args ...uint64) {
 func traceEventLocked(extraBytes int, mp *m, pid int32, bufp *traceBufPtr, ev byte, stackID uint32, skip int, args ...uint64) {
 	buf := bufp.ptr()
 	// TODO: test on non-zero extraBytes param.
-	maxSize := 2 + 5*traceBytesPerNumber + extraBytes // event type, length, sequence, timestamp, stack id and two add params
+	maxSize := 1 + // event type
+		traceBytesPerNumber + // event size
+		(len(args)+2)*traceBytesPerNumber + // args, plus timestamp and stack ID
+		extraBytes
 	if buf == nil || len(buf.arr)-buf.pos < maxSize {
 		buf = traceFlush(traceBufPtrOf(buf), pid).ptr()
 		bufp.set(buf)
@@ -637,8 +648,12 @@ func traceEventLocked(extraBytes int, mp *m, pid int32, bufp *traceBufPtr, ev by
 		tickDiff = 1
 	}
 
+	if stackID == 0 && skip > 0 {
+		stackID = uint32(traceStackID(mp, buf.stk[:], skip))
+	}
+
 	buf.lastTicks = ticks
-	narg := byte(len(args))
+	narg := len(args)
 	if stackID != 0 || skip >= 0 {
 		narg++
 	}
@@ -648,9 +663,26 @@ func traceEventLocked(extraBytes int, mp *m, pid int32, bufp *traceBufPtr, ev by
 		narg = 3
 	}
 	startPos := buf.pos
-	buf.byte(ev | narg<<traceArgCountShift)
+	buf.byte(ev | byte(narg)<<traceArgCountShift)
 	var lenp *byte
-	if narg == 3 {
+	// largeEventArgCount is the maximum number of arguments an
+	// event can have, not counting the tick diff and stack ID
+	// arguments, which can be guaranteed to produce a less than 128
+	// byte event.
+	const largeEventArgCount = (127 / traceBytesPerNumber) - 2
+	if len(args) > largeEventArgCount {
+		// With enough args, we can't guarantee the event will be < 128 bytes.
+		// We need to compute how big it will actually be first,
+		// since the size comes before the other arguments.
+		size := varintSize(tickDiff)
+		if stackID != 0 || skip >= 0 {
+			size += varintSize(uint64(stackID))
+		}
+		for _, a := range args {
+			size += varintSize(a)
+		}
+		buf.varint(size)
+	} else if narg == 3 {
 		// Reserve the byte for length assuming that length < 128.
 		buf.varint(0)
 		lenp = &buf.arr[buf.pos-1]
@@ -659,12 +691,8 @@ func traceEventLocked(extraBytes int, mp *m, pid int32, bufp *traceBufPtr, ev by
 	for _, a := range args {
 		buf.varint(a)
 	}
-	if stackID != 0 {
+	if stackID != 0 || skip >= 0 {
 		buf.varint(uint64(stackID))
-	} else if skip == 0 {
-		buf.varint(0)
-	} else if skip > 0 {
-		buf.varint(traceStackID(mp, buf.stk[:], skip))
 	}
 	evSize := buf.pos - startPos
 	if evSize > maxSize {
@@ -674,6 +702,15 @@ func traceEventLocked(extraBytes int, mp *m, pid int32, bufp *traceBufPtr, ev by
 		// Fill in actual length.
 		*lenp = byte(evSize - 2)
 	}
+}
+
+// varintSize returns the number of bytes needed to varint-encode n.
+func varintSize(n uint64) uint64 {
+	var i uint64
+	for ; n >= 0x80; n >>= 7 {
+		i++
+	}
+	return i + 1
 }
 
 // traceCPUSample writes a CPU profile sample stack to the execution tracer's
@@ -779,6 +816,54 @@ func traceReadCPU() {
 			traceEventLocked(0, nil, 0, bufp, traceEvCPUSample, stackID, 1, timestamp/traceTickDiv, ppid, goid)
 		}
 	}
+}
+
+// traceGoroutineLabels records each of the key-value profile label pairs for gp
+func traceGoroutineLabels(gp *g) {
+	// Duplicated definition of the same type in runtime/pprof
+	type labelMap map[string]string
+
+	// The goroutine may be assigned 0 labels if the user sets labels,
+	// performs an action, and then restores the previous (possibly empty)
+	// label set. See pprof.Do. Thus, the label map may be nil, or empty,
+	// and an event with no labels will be recorded in those cases.
+	//
+	// This function records all of the goroutine's labels. As a possible
+	// space savings, this function could record only the labels which have
+	// changed.
+	var m labelMap
+	if gp.labels != nil {
+		m = *(*labelMap)(gp.labels)
+	}
+
+	mp, pid, bufp := traceAcquireBuffer()
+	defer traceReleaseBuffer(pid)
+	// see traceEvent comment, we need to double-check that tracing hasn't
+	// been disabled
+	if !trace.enabled && !mp.startingtrace {
+		return
+	}
+	// We don't need an event for goroutines which had no labels when the trace
+	// was started
+	if mp.startingtrace && len(m) == 0 {
+		return
+	}
+	args := make([]uint64, 0, 1+2*len(m))
+	args = append(args, uint64(gp.goid))
+	for k, v := range m {
+		var key, value uint64
+		key, bufp = traceString(bufp, pid, k)
+		value, bufp = traceString(bufp, pid, v)
+		args = append(args, key, value)
+	}
+	skip := 3
+	if mp.startingtrace {
+		// At the start of tracing, the stack would just be where the
+		// trace started, not where the label was set. Omit it in that
+		// case.
+		skip = 0
+	}
+	traceEventLocked(0, mp, pid, bufp, traceEvGoroutineLabels, 0, skip, args...)
 }
 
 func traceStackID(mp *m, buf []uintptr, skip int) uint64 {

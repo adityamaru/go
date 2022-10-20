@@ -790,3 +790,132 @@ func saveTrace(t *testing.T, buf *bytes.Buffer, name string) {
 		t.Errorf("failed to write trace file: %s", err)
 	}
 }
+
+func TestProfileLabels(t *testing.T) {
+	if IsEnabled() {
+		t.Skip("skipping because -test.trace is set")
+	}
+
+	var started sync.WaitGroup
+	applyLabels := func(labels ...string) {
+		defer started.Done()
+		ctx := pprof.WithLabels(context.Background(), pprof.Labels(labels...))
+		pprof.SetGoroutineLabels(ctx)
+	}
+	doLabels := func(labels ...string) {
+		pprof.Do(context.Background(), pprof.Labels(labels...), func(_ context.Context) {
+			defer started.Done()
+		})
+	}
+	// stop keeps the pre-existing goroutine alive until after the trace
+	// has started
+	stop := make(chan struct{})
+	started.Add(1)
+	go func() {
+		applyLabels("pre-existing", "foo")
+		<-stop
+	}()
+	// Wait for the pre-existing goroutine to return from applyLabels so
+	// that we know it has the expected labels before starting the trace
+	started.Wait()
+
+	buf := new(bytes.Buffer)
+	if err := Start(buf); err != nil {
+		t.Fatalf("failed to start tracing: %v", err)
+	}
+
+	started.Add(3)
+	go applyLabels("label", "1")
+	go applyLabels("label", "2", "other", "3")
+	go doLabels("using-do", "4")
+	started.Wait()
+	close(stop)
+	Stop()
+
+	events, _ := parseTrace(t, buf)
+	type Labels map[string]string
+	equals := func(a, b Labels) bool {
+		if len(a) != len(b) {
+			return false
+		}
+		for k, v := range a {
+			w, ok := b[k]
+			if !ok || w != v {
+				return false
+			}
+		}
+		return true
+	}
+	contains := func(labelSets []Labels, l Labels) bool {
+		for _, m := range labelSets {
+			if equals(m, l) {
+				return true
+			}
+		}
+		return false
+	}
+	expected := []Labels{
+		{"label": "1"},
+		{"label": "2", "other": "3"},
+		{"pre-existing": "foo"},
+		// Using pprof.Do, we should see two events: the labels being
+		// set, and then the labels being restored to their previous
+		// values. If the goroutine has no previous values, then there
+		// should be an event with no labels
+		{"using-do": "4"},
+		{},
+	}
+	var observed []Labels
+	for _, event := range events {
+		if event.Type != trace.EvGoroutineLabels {
+			continue
+		}
+		l := make(Labels)
+		for i := 0; i < len(event.SArgs); i += 2 {
+			l[event.SArgs[i]] = event.SArgs[i+1]
+		}
+		if !contains(expected, l) {
+			t.Errorf("event with unexpected label set %v", l)
+		}
+		observed = append(observed, l)
+	}
+
+	for _, l := range expected {
+		if !contains(observed, l) {
+			t.Errorf("missing expected label set %v", l)
+		}
+	}
+
+	saveTrace(t, buf, "TestProfileLabels")
+}
+
+func TestProfileLabelsLargeSet(t *testing.T) {
+	if IsEnabled() {
+		t.Skip("skipping because -test.trace is set")
+	}
+
+	buf := new(bytes.Buffer)
+	if err := Start(buf); err != nil {
+		t.Fatalf("failed to start tracing: %v", err)
+	}
+
+	var labels []string
+	const pairs = 256
+	for i := 0; i < pairs; i++ {
+		labels = append(labels,
+			fmt.Sprintf("key-%d", i),
+			"value",
+		)
+	}
+	pprof.Do(context.Background(), pprof.Labels(labels...), func(ctx context.Context) {
+		// no-op, just want the labels to be applied and restored afterward
+		return
+	})
+	Stop()
+
+	if _, err := trace.Parse(bytes.NewReader(buf.Bytes()), ""); err != nil {
+		t.Fatalf("parsing trace: %v", err)
+	}
+
+	saveTrace(t, buf, "TestProfileLabelsLarge")
+}
