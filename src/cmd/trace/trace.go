@@ -184,10 +184,32 @@ func httpJsonTrace(w http.ResponseWriter, r *http.Request) {
 		log.Printf("failed to parse trace: %v", err)
 		return
 	}
+	if err := r.ParseForm(); err != nil {
+		// TODO: 4xx?
+		log.Printf("failed to parse request form: %v", err)
+		return
+	}
 
 	params := &traceParams{
 		parsed:  res,
 		endTime: math.MaxInt64,
+	}
+
+	if keys, values := r.Form["lk"], r.Form["lv"]; len(keys) > 0 {
+		if len(keys) != len(values) {
+			log.Printf("mismatched number of label key & value filters")
+			return
+		}
+		labelFilter := make(map[string]string)
+		for i, key := range keys {
+			if key == "" {
+				continue
+			}
+			value := values[i]
+			labelFilter[key] = value
+		}
+		params.mode |= modeLabelOriented
+		params.labelFilter = labelFilter
 	}
 
 	if goids := r.FormValue("goid"); goids != "" {
@@ -403,13 +425,14 @@ func (cw *countingWriter) Write(data []byte) (int, error) {
 }
 
 type traceParams struct {
-	parsed    trace.ParseResult
-	mode      traceviewMode
-	startTime int64
-	endTime   int64
-	maing     uint64          // for goroutine-oriented view, place this goroutine on the top row
-	gs        map[uint64]bool // Goroutines to be displayed for goroutine-oriented or task-oriented view
-	tasks     []*taskDesc     // Tasks to be displayed. tasks[0] is the top-most task
+	parsed      trace.ParseResult
+	mode        traceviewMode
+	startTime   int64
+	endTime     int64
+	maing       uint64            // for goroutine-oriented view, place this goroutine on the top row
+	gs          map[uint64]bool   // Goroutines to be displayed for goroutine-oriented or task-oriented view
+	tasks       []*taskDesc       // Tasks to be displayed. tasks[0] is the top-most task
+	labelFilter map[string]string // for filtering Gs by goroutine labels
 }
 
 type traceviewMode uint
@@ -417,6 +440,7 @@ type traceviewMode uint
 const (
 	modeGoroutineOriented traceviewMode = 1 << iota
 	modeTaskOriented
+	modeLabelOriented
 )
 
 type traceContext struct {
@@ -432,6 +456,15 @@ type traceContext struct {
 	gstates, prevGstates         [gStateCount]int64
 
 	regionID int // last emitted region id. incremented in each emitRegion call.
+
+	// matchedGs tracks time intervals for each G where G had labels which
+	// matched the labels in traceParams.labelFilter
+	matchedGs map[uint64][]matchInterval
+}
+
+type matchInterval struct {
+	start int64
+	end   int64
 }
 
 type heapStats struct {
@@ -514,6 +547,7 @@ func generateTrace(params *traceParams, consumer traceConsumer) error {
 	ctx := &traceContext{traceParams: params}
 	ctx.frameTree.children = make(map[uint64]frameNode)
 	ctx.consumer = consumer
+	ctx.matchedGs = make(map[uint64][]matchInterval)
 
 	ctx.consumer.consumeTimeUnit("ns")
 	maxProc := 0
@@ -544,6 +578,45 @@ func generateTrace(params *traceParams, consumer traceConsumer) error {
 		ctx.gstates[info.state]--
 		ctx.gstates[newState]++
 		info.state = newState
+	}
+
+	if ctx.mode&modeLabelOriented != 0 {
+		for _, ev := range ctx.parsed.Events {
+			switch ev.Type {
+			case trace.EvGoCreate:
+				newG := ev.Args[0]
+				// We want to see if ev.G *currently* has
+				// matching labels, meaning we haven't assigned
+				// an end timestamp to its most recent matching
+				// interval. If this is the case, the new G should
+				// inherit the labels
+				if m, ok := ctx.matchedGs[ev.G]; ok && m[len(m)-1].end == 0 {
+					ctx.matchedGs[newG] = append(ctx.matchedGs[newG], matchInterval{start: ev.Ts})
+				}
+			case trace.EvGoEnd:
+				if l, ok := ctx.matchedGs[ev.G]; ok {
+					n := len(l) - 1
+					l[n].end = ev.Ts
+				}
+			case trace.EvGoroutineLabels:
+				matched := len(ev.SArgs) > 0
+				for i := 0; i < len(ev.SArgs); i += 2 {
+					key, value := ev.SArgs[i], ev.SArgs[i+1]
+					expected, ok := ctx.labelFilter[key]
+					if ok && (expected != "" && value != expected) {
+						matched = false
+						if l, ok := ctx.matchedGs[ev.G]; ok {
+							n := len(l) - 1
+							l[n].end = ev.Ts
+						}
+						break
+					}
+				}
+				if matched {
+					ctx.matchedGs[ev.G] = append(ctx.matchedGs[ev.G], matchInterval{start: ev.Ts})
+				}
+			}
+		}
 	}
 
 	for _, ev := range ctx.parsed.Events {
@@ -620,6 +693,8 @@ func generateTrace(params *traceParams, consumer traceConsumer) error {
 			ctx.heapStats.heapAlloc = ev.Args[0]
 		case trace.EvHeapGoal:
 			ctx.heapStats.nextGC = ev.Args[0]
+		case trace.EvGoroutineLabels:
+			ctx.emitInstant(ev, "goroutine labels", "")
 		}
 		if setGStateErr != nil {
 			return setGStateErr
@@ -886,6 +961,25 @@ func (ctx *traceContext) makeSlice(ev *trace.Event, name string) *traceviewer.Ev
 			sl.Cname = colorLightGrey
 		}
 	}
+	// grey out events for goroutines which didn't have matching labels
+	// during the event
+	if ctx.mode&modeLabelOriented != 0 && ev.G != 0 {
+		l := ctx.matchedGs[ev.G]
+		match := false
+		for _, m := range l {
+			if m.end == 0 {
+				// G still has the matched labels. Artificially
+				// make this overlap with the current event.
+				m.end = ev.Ts + 1
+			}
+			if overlappingDuration(m.start, m.end, ev.Ts, ev.Link.Ts) > 0 {
+				match = true
+			}
+		}
+		if !match {
+			sl.Cname = colorLightGrey
+		}
+	}
 	return sl
 }
 
@@ -1056,6 +1150,13 @@ func (ctx *traceContext) emitInstant(ev *trace.Event, name, category string) {
 			ThreadID uint64
 		}
 		arg = &Arg{ev.Args[0]}
+	}
+	if ev.Type == trace.EvGoroutineLabels {
+		m := make(map[string]string)
+		for i := 0; i < len(ev.SArgs); i += 2 {
+			m[ev.SArgs[i]] = ev.SArgs[i+1]
+		}
+		arg = m
 	}
 	ctx.emit(&traceviewer.Event{
 		Name:     name,
