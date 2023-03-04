@@ -14,6 +14,7 @@ package runtime
 
 import (
 	"internal/goarch"
+	"log"
 	"runtime/internal/atomic"
 	"runtime/internal/sys"
 	"unsafe"
@@ -270,7 +271,6 @@ func StartTrace() error {
 			gp.tracelastp = getg().m.p
 			// +PCQuantum because traceFrameForPC expects return PCs and subtracts PCQuantum.
 			id := trace.stackTab.put([]uintptr{startPCforTrace(gp.startpc) + sys.PCQuantum})
-			traceEvent(traceEvGoCreate, -1, uint64(gp.goid), uint64(id), stackID)
 			traceEvent(traceEvGoCreate, -1, uint64(gp.goid), uint64(id), stackID)
 
 			// Goroutines which existed before tracing started can have labels, so
@@ -835,6 +835,7 @@ func traceGoroutineLabels(gp *g) {
 	if gp.labels != nil {
 		m = *(*labelMap)(gp.labels)
 	}
+	log.Printf("goroutine ID %d, labels %+v", gp.goid, m)
 
 	mp, pid, bufp := traceAcquireBuffer()
 	defer traceReleaseBuffer(pid)

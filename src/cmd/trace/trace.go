@@ -209,6 +209,7 @@ func httpJsonTrace(w http.ResponseWriter, r *http.Request) {
 			labelFilter[key] = value
 		}
 		params.mode |= modeLabelOriented
+		log.Printf("these are the labels %+v", labelFilter)
 		params.labelFilter = labelFilter
 	}
 
@@ -599,17 +600,40 @@ func generateTrace(params *traceParams, consumer traceConsumer) error {
 					l[n].end = ev.Ts
 				}
 			case trace.EvGoroutineLabels:
-				matched := len(ev.SArgs) > 0
+				matched := false
 				for i := 0; i < len(ev.SArgs); i += 2 {
 					key, value := ev.SArgs[i], ev.SArgs[i+1]
 					expected, ok := ctx.labelFilter[key]
-					if ok && (expected != "" && value != expected) {
-						matched = false
+					log.Printf("key is %s and value is %s", key, value)
+					log.Printf("goroutine is %d", ev.G)
+					if ok {
+						if expected == "" {
+							matched = true
+							break
+						}
+
+						// The expected value is non-empty. If the expected
+						// value matches the goroutine label value we continue
+						// matching following labels.
+						if value == expected {
+							matched = true
+							continue
+						} else {
+							// If the expected value does not match the
+							// goroutine label value we do not need to continue
+							// matching the following labels.
+							matched = false
+							if l, ok := ctx.matchedGs[ev.G]; ok {
+								n := len(l) - 1
+								l[n].end = ev.Ts
+							}
+							break
+						}
+					} else {
 						if l, ok := ctx.matchedGs[ev.G]; ok {
 							n := len(l) - 1
 							l[n].end = ev.Ts
 						}
-						break
 					}
 				}
 				if matched {
@@ -694,6 +718,8 @@ func generateTrace(params *traceParams, consumer traceConsumer) error {
 		case trace.EvHeapGoal:
 			ctx.heapStats.nextGC = ev.Args[0]
 		case trace.EvGoroutineLabels:
+			info := getGInfo(ev.G)
+			log.Printf("labelled goroutines %s", info.name)
 			ctx.emitInstant(ev, "goroutine labels", "")
 		}
 		if setGStateErr != nil {
@@ -761,6 +787,7 @@ func generateTrace(params *traceParams, consumer traceConsumer) error {
 			ctx.emit(slice)
 		case trace.EvGoStart, trace.EvGoStartLabel:
 			info := getGInfo(ev.G)
+			log.Printf("goroutine ID %s", info.name)
 			if ev.Type == trace.EvGoStartLabel {
 				ctx.emitSlice(ev, ev.SArgs[0])
 			} else {

@@ -1157,5 +1157,5 @@ var EventDescriptions = [EvCount]struct {
 	// of labels. There can be zero labels in an event, such as when
 	// pprof.Do restores the previous (possibly empty) set of labels to a
 	// goroutine.
-	EvGoroutineLabels: {"GoroutineLabels", 1021, true, []string{"g"}, nil},
+	EvGoroutineLabels: {"GoroutineLabels", 1019, true, []string{"g"}, nil},
 }
